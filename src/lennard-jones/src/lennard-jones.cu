@@ -94,6 +94,7 @@ __global__ void compute_ke_kernel(const Particle *particles, double *partial_ke,
 
 __global__ void sum_array_kernel(const double* input, double* output, unsigned int n) {
     // Cache za delne vsote v bloku
+    // Uporabljamo sum_cache namesto input, ker je sum_cache shared memory in je hitrejši za dostop znotraj bloka, medtem ko je input global memory in je počasnejši, zato delamo delne vsote v sum_cache in potem seštejemo te delne vsote
     extern __shared__ double sum_cache[];
 
     // Thread idx
@@ -517,16 +518,21 @@ SimulationResult run_simulation(Particle *particles, unsigned int n, unsigned in
 #else
     // Pointer na partikle na GPU
     Particle* d_particles = NULL;
-    // Pointer na partikle na CPU
+    // Pointer na partikle na CPU (pinned memory)
     Particle* h_particles_pinned = NULL;
 
+#if GENERATE_GIF
     // Alociranje PINNED pomnilnika, ki je dostopen tudi CPU-ju in GPU-ju
     checkCudaErrors(cudaHostAlloc(&h_particles_pinned, n * sizeof(Particle), cudaHostAllocMapped));
     checkCudaErrors(cudaHostGetDevicePointer(&d_particles, h_particles_pinned, 0));
 
-    // Kopiranje začetnih podatkov iz običajnega calloc v PINNED calloc, tako se izognemo dodatnemu kopiranju med CPU-jem in GPU-jem v vsakem koraku, saj bo GPU direktno dostopal do PINNED calloc-a
-    // Small price za biger reward
+    // Kopiranje začetnih podatkov iz običajnega calloc v PINNED calloc
     memcpy(h_particles_pinned, particles, n * sizeof(Particle));
+#else
+    // Allociranje direktno na GPU
+    checkCudaErrors(cudaMalloc(&d_particles, n * sizeof(Particle)));
+    checkCudaErrors(cudaMemcpy(d_particles, particles, n * sizeof(Particle), cudaMemcpyHostToDevice));
+#endif
 
     out.start_potential= compute_forcesGPU(d_particles, n, box_size);
     out.start_kinetic = compute_keGPU(d_particles, n);
@@ -540,7 +546,7 @@ SimulationResult run_simulation(Particle *particles, unsigned int n, unsigned in
     if (!gif) {
         fprintf(stderr, "Warning: failed to create GIF output %s\n", GIF_FILE);
     } else {
-        // Render the first frame using the pinned host pointer
+        // Render the first frame
 #if RUN_CPU
         render_frame_gif(gif, particles, n, box_size);
 #else
@@ -591,8 +597,16 @@ SimulationResult run_simulation(Particle *particles, unsigned int n, unsigned in
 
 #if !RUN_CPU
     checkCudaErrors(cudaDeviceSynchronize());
+#if GENERATE_GIF
+    // Pinned memory cleanup
     memcpy(particles, h_particles_pinned, n * sizeof(Particle));
     checkCudaErrors(cudaFreeHost(h_particles_pinned));
+#else
+    // Kopiranje zadnega reyultata nazaj na CPU
+    checkCudaErrors(cudaMemcpy(particles, d_particles, n * sizeof(Particle), cudaMemcpyDeviceToHost));
+    // Free GPU memory
+    checkCudaErrors(cudaFree(d_particles));
+#endif
 #endif
 
     out.n = n;
