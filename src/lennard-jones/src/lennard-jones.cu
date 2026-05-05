@@ -12,7 +12,8 @@
 #include "gifenc.h"
 #include "lennard-jones.h"
 
-#define NUM_THREADS 256
+#define NUM_THREADS 128
+#define RUN_CPU 1
 
 // plotting functions
 #if GENERATE_GIF
@@ -128,30 +129,31 @@ double compute_keGPU(const Particle *particles, unsigned int n) {
     size_t shared_mem_size = NUM_THREADS * sizeof(double);
 
     int num_blocks = (n + NUM_THREADS - 1) / NUM_THREADS;
-    double *d_partial_ke;
-    cudaMalloc(&d_partial_ke, num_blocks * sizeof(double));
+    double *d_partial_ke_in;
+    double *d_partial_ke_out;
+    cudaMalloc(&d_partial_ke_in, num_blocks * sizeof(double));
+    cudaMalloc(&d_partial_ke_out, num_blocks * sizeof(double));
 
-    compute_ke_kernel<<<num_blocks, NUM_THREADS, shared_mem_size>>>(particles, d_partial_ke, n);
+    compute_ke_kernel<<<num_blocks, NUM_THREADS, shared_mem_size>>>(particles, d_partial_ke_in, n);
 
-    // Zdaj imamo delne vsote v d_partial_ke, potrebujemo še en kernel za seštevanje teh delnih vsot
-    int num_blocks_sum = (num_blocks + NUM_THREADS - 1) / NUM_THREADS;
-    
-    while(num_blocks_sum > 1) {
-        int blocks = (num_blocks_sum + NUM_THREADS - 1) / NUM_THREADS;
-        double *d_output;
-        cudaMalloc(&d_output, blocks * sizeof(double));
-
-        sum_array_kernel<<<blocks, NUM_THREADS, shared_mem_size>>>(d_partial_ke, d_output, num_blocks_sum);
+    // Zdaj imamo delne vsote v d_partial_ke_in, potrebujemo še en kernel za seštevanje teh delnih vsot
+    while(num_blocks > 1) {
+        // Seštej delne vsote v d_partial_ke_in in shrani rezultat v d_partial_ke_out
+        int blocks = (num_blocks + NUM_THREADS - 1) / NUM_THREADS;
+        sum_array_kernel<<<blocks, NUM_THREADS, shared_mem_size>>>(d_partial_ke_in, d_partial_ke_out, num_blocks);
         checkCudaErrors(cudaGetLastError());
 
-        cudaFree(d_partial_ke);
-        d_partial_ke = d_output;
-        num_blocks_sum = blocks;
+        // Zamenjaj pointerje, da bo d_partial_ke_in vedno kazal na trenutno delno vsoto, ki jo je treba sešteti v naslednjem koraku
+        double *temp = d_partial_ke_in;
+        d_partial_ke_in = d_partial_ke_out;
+        d_partial_ke_out = temp;
+        num_blocks = blocks;
     }
 
     double ke;
-    cudaMemcpy(&ke, d_partial_ke, sizeof(double), cudaMemcpyDeviceToHost);
-    cudaFree(d_partial_ke);
+    cudaMemcpy(&ke, d_partial_ke_in, sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(d_partial_ke_in);
+    cudaFree(d_partial_ke_out);
 
     return ke;
 }
@@ -248,6 +250,14 @@ __host__ __device__ double compute_v_shift(void) {
     return 4.0 * EPSILON * (pow(SIGMA / R_CUT, 12.0) - pow(SIGMA / R_CUT, 6.0));
 }
 
+__global__ void zero_forces_kernel(Particle *particles, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        particles[i].fx = 0.0;
+        particles[i].fy = 0.0;
+    }
+}
+
 __global__ void compute_forces_kernel(Particle *particles, double *potential_energy, unsigned int n, double box_size) {
     // Thread idx
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -265,12 +275,7 @@ __global__ void compute_forces_kernel(Particle *particles, double *potential_ene
 
         double v_shift = compute_v_shift();
 
-        for (unsigned int j = 0; j < n; j++) {
-            // particle ne vpliva sama nase
-            if(j == i) {
-                continue;
-            }
-
+        for (unsigned int j = i + 1; j < n; j++) {
             // Pozicija partikla j
             double pj_x = particles[j].x;
             double pj_y = particles[j].y;
@@ -291,14 +296,21 @@ __global__ void compute_forces_kernel(Particle *particles, double *potential_ene
                 fx += fij * dx / r;
                 fy += fij * dy / r;
 
+                // Dodaj silo partiklu i
+                atomicAdd(&particles[i].fx, fx);
+                atomicAdd(&particles[i].fy, fy);
+
+                // Dodaj nasprotno silo partiklu j
+                // Dodaj mu nasprotno silo (3. Newtonov zakon)
+                atomicAdd(&particles[j].fx, -fx);
+                atomicAdd(&particles[j].fy, -fy);
+
                 // LJ potencialna energija
                 double vij = 4.0 * EPSILON * (pow(sr, 12.0) - pow(sr, 6.0)) - v_shift;
                 pe += 0.5 * vij;
             }
         }
         // Posodobi sile in potencialno energijo za partikla i
-        particles[i].fx = fx;
-        particles[i].fy = fy;
         potential_energy[i] = pe;
 
         // Prestavi se na naslednji particle, ki ga ta thread obdeluje, če je potrebno
@@ -307,32 +319,43 @@ __global__ void compute_forces_kernel(Particle *particles, double *potential_ene
 }
 
 double compute_forcesGPU(Particle *particles, unsigned int n, double box_size) {
-    int num_blocks = (n + NUM_THREADS - 1) / NUM_THREADS;
     size_t shared_mem_size = NUM_THREADS * sizeof(double);
 
     double *d_potential_energy;
     cudaMalloc(&d_potential_energy, n * sizeof(double));
 
-    compute_forces_kernel<<<num_blocks, NUM_THREADS, shared_mem_size>>>(particles, d_potential_energy, n, box_size);
+    int num_blocks = (n + NUM_THREADS - 1) / NUM_THREADS;
+    zero_forces_kernel<<<num_blocks, NUM_THREADS>>>(particles, n);
+    checkCudaErrors(cudaGetLastError());
+    compute_forces_kernel<<<num_blocks, NUM_THREADS>>>(particles, d_potential_energy, n, box_size);
     checkCudaErrors(cudaGetLastError());
 
-    int num_blocks_sum = (n + NUM_THREADS - 1) / NUM_THREADS;
-    while(num_blocks_sum > 1) {
-        int blocks = (num_blocks_sum + NUM_THREADS - 1) / NUM_THREADS;
-        double *d_output;
-        cudaMalloc(&d_output, blocks * sizeof(double));
+    double *d_potential_energy_in;
+    double *d_potential_energy_out;
+    cudaMalloc(&d_potential_energy_in, num_blocks * sizeof(double));
+    cudaMalloc(&d_potential_energy_out, num_blocks * sizeof(double));
 
-        sum_array_kernel<<<blocks, NUM_THREADS, shared_mem_size>>>(d_potential_energy, d_output, num_blocks_sum);
+    sum_array_kernel<<<num_blocks, NUM_THREADS, shared_mem_size>>>(d_potential_energy, d_potential_energy_in, n);
+    checkCudaErrors(cudaGetLastError());
+
+    n = num_blocks;
+
+    while(n > 1) {
+        num_blocks = (n + NUM_THREADS - 1) / NUM_THREADS;
+        sum_array_kernel<<<num_blocks, NUM_THREADS, shared_mem_size>>>(d_potential_energy_in, d_potential_energy_out, n);
         checkCudaErrors(cudaGetLastError());
 
-        cudaFree(d_potential_energy);
-        d_potential_energy = d_output;
-        num_blocks_sum = blocks;
+        double *temp = d_potential_energy_in;
+        d_potential_energy_in = d_potential_energy_out;
+        d_potential_energy_out = temp;
+        n = num_blocks;
     }
 
     double pe;
-    cudaMemcpy(&pe, d_potential_energy, sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&pe, d_potential_energy_in, sizeof(double), cudaMemcpyDeviceToHost);
     cudaFree(d_potential_energy);
+    cudaFree(d_potential_energy_in);
+    cudaFree(d_potential_energy_out);
 
     return pe;
 }
@@ -348,10 +371,7 @@ double compute_forcesCPU(Particle *particles, unsigned int n, double box_size) {
     double v_shift = compute_v_shift();
     #pragma omp parallel for reduction(+:pe)
     for (unsigned int i = 0; i < n; ++i) {
-        for (unsigned int j = 0; j < n; ++j) {
-            if (j == i) {
-                continue;
-            }
+        for (unsigned int j = i + 1; j < n; ++j) {
             Particle *pi = &particles[i];
             Particle *pj = &particles[j];
             
@@ -373,15 +393,25 @@ double compute_forcesCPU(Particle *particles, unsigned int n, double box_size) {
             double fx = fij * dx / r;
             double fy = fij * dy / r;
 
+            // 3. Newtnov zakon
+            #pragma omp atomic
             pi->fx += fx;
+            #pragma omp atomic
             pi->fy += fy;
+            
+            #pragma omp atomic
+            pj->fx -= fx;
+            #pragma omp atomic
+            pj->fy -= fy;
 
             double vij = 4.0 * EPSILON * (pow(sr, 12.0) - pow(sr, 6.0)) - v_shift;
-            pe += 0.5 * vij;
+            // Dodamo za oba partikla
+            pe += vij;
         }
     }
 
-    return pe;
+    // Vrnemo polovico, ker smo prej dodal za oba partikla
+    return pe * 0.5;
 }
 
 __global__ void leapfrog_step1_kernel(Particle *particles, unsigned int n, double box_size) {
@@ -478,23 +508,32 @@ double leapfrog_stepCPU(Particle *particles, unsigned int n, double box_size) {
 }
 
 SimulationResult run_simulation(Particle *particles, unsigned int n, unsigned int nsteps, double box_size, int log_steps) {
-  
-    Particle* d_particles = NULL; // This will be our device pointer
-    Particle* h_particles_pinned = NULL; // This will be our pinned host pointer
 
-    // Allocate pinned host memory and get a device pointer to it.
+    SimulationResult out;
+
+#if RUN_CPU
+    out.start_potential= compute_forces(particles, n, box_size);
+    out.start_kinetic = compute_ke(particles, n);
+#else
+    // Pointer na partikle na GPU
+    Particle* d_particles = NULL;
+    // Pointer na partikle na CPU
+    Particle* h_particles_pinned = NULL;
+
+    // Alociranje PINNED pomnilnika, ki je dostopen tudi CPU-ju in GPU-ju
     checkCudaErrors(cudaHostAlloc(&h_particles_pinned, n * sizeof(Particle), cudaHostAllocMapped));
     checkCudaErrors(cudaHostGetDevicePointer(&d_particles, h_particles_pinned, 0));
 
-    // Copy the initial data into the new pinned memory block
+    // Kopiranje začetnih podatkov iz običajnega calloc v PINNED calloc, tako se izognemo dodatnemu kopiranju med CPU-jem in GPU-jem v vsakem koraku, saj bo GPU direktno dostopal do PINNED calloc-a
+    // Small price za biger reward
     memcpy(h_particles_pinned, particles, n * sizeof(Particle));
 
-    SimulationResult out;
     out.start_potential= compute_forcesGPU(d_particles, n, box_size);
     out.start_kinetic = compute_keGPU(d_particles, n);
-    out.start_total = out.start_kinetic + out.start_potential;
+#endif        
 
-    
+    out.start_total = out.start_kinetic + out.start_potential;
+        
 #if GENERATE_GIF
     ge_GIF *gif = NULL;
     gif = ge_new_gif(GIF_FILE, (uint16_t)FRAME_WIDTH, (uint16_t)FRAME_HEIGHT, palette, 8, -1, 0);
@@ -502,14 +541,24 @@ SimulationResult run_simulation(Particle *particles, unsigned int n, unsigned in
         fprintf(stderr, "Warning: failed to create GIF output %s\n", GIF_FILE);
     } else {
         // Render the first frame using the pinned host pointer
+#if RUN_CPU
+        render_frame_gif(gif, particles, n, box_size);
+#else
         render_frame_gif(gif, h_particles_pinned, n, box_size);
+#endif
         ge_add_frame(gif, FRAME_DELAY);
     }
 #endif
 
     for (unsigned int step = 0; step < nsteps; step++) {
+#if RUN_CPU
+        out.final_potential = leapfrog_stepCPU(particles, n, box_size);
+        out.final_kinetic = compute_keCPU(particles, n);
+#else
         out.final_potential = leapfrog_stepGPU(d_particles, n, box_size);
         out.final_kinetic = compute_keGPU(d_particles, n);
+#endif
+        
         out.final_total = out.final_kinetic + out.final_potential;
         if (log_steps) {
             printf(
@@ -523,10 +572,12 @@ SimulationResult run_simulation(Particle *particles, unsigned int n, unsigned in
     
 #if GENERATE_GIF
         if (gif && FRAME_EVERY > 0 && (step + 1) % FRAME_EVERY == 0) {
-            // We need to ensure the GPU is done computing before the CPU reads the memory.
+#if RUN_CPU
+            render_frame_gif(gif, particles, n, box_size);
+#else
             checkCudaErrors(cudaDeviceSynchronize()); 
-            // No cudaMemcpy! Just render directly from the pinned host pointer.
             render_frame_gif(gif, h_particles_pinned, n, box_size);
+#endif
             ge_add_frame(gif, FRAME_DELAY);
         }
 #endif
@@ -538,16 +589,13 @@ SimulationResult run_simulation(Particle *particles, unsigned int n, unsigned in
     }
 #endif
 
-    // Ensure all GPU work is done before we copy the final results and clean up.
+#if !RUN_CPU
     checkCudaErrors(cudaDeviceSynchronize());
-
-    // Copy the final results from pinned memory back to the original array.
     memcpy(particles, h_particles_pinned, n * sizeof(Particle));
-
-    // Free the pinned host memory. This also invalidates the device pointer.
     checkCudaErrors(cudaFreeHost(h_particles_pinned));
+#endif
 
     out.n = n;
-    out.particles = particles; // Return the original, now updated, host array
+    out.particles = particles;
     return out;
 }

@@ -11,8 +11,8 @@ void print_help(const char *exe) {
 
 int main(int argc, char **argv) {
     // default parameters
-    unsigned int nsteps = 100;
-    unsigned int n = 100;
+    unsigned int nsteps = 5000;
+    unsigned int n = 1000;
     double density = 0.95;
     double temperature = 0.5;
     unsigned int seed = 42;
