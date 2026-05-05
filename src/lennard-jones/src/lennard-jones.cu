@@ -4,12 +4,16 @@
 #include <string.h>
 
 // Include CUDA headers
-// #include <cuda_runtime.h>
-// #include <cuda.h>
+#include "helper_cuda.h"
+#include <cuda_runtime.h>
+#include <cuda.h>
 
 
 #include "gifenc.h"
 #include "lennard-jones.h"
+
+#define NUM_THREADS 128
+#define RUN_CPU 0
 
 // plotting functions
 #if GENERATE_GIF
@@ -50,9 +54,115 @@ double random_double(void) {
     return (double)rand() / (double)RAND_MAX;
 }
 
-// compute kinetic energy of the system
-double compute_ke(const Particle *particles, unsigned int n) {
+__global__ void compute_ke_kernel(const Particle *particles, double *partial_ke, unsigned int n) {
+    // Cache za delne vsote kinetične energije v bloku
+    extern __shared__ double ke_cache[];
+
+    // Thread idx
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int tid = threadIdx.x;
+
     double ke = 0.0;
+    // While je zato, če se zgodi, da je en thread slučajno zadolžen za več partiklov
+    while(i < n) {
+        const Particle *p = &particles[i];
+        // Izračun kinetične energije
+        ke += 0.5 * (p->vx * p->vx + p->vy * p->vy);
+        // Prestavi se na naslednji particle, ki ga ta thread obdeluje, če je potrebno (Prestavi se za stevilo threadov v celotnem gridu)
+        i += blockDim.x * gridDim.x;
+    }
+    // Zapiše delno vsoto kinetične energije za ta thread v cache
+    ke_cache[tid] = ke;
+
+    // Počak da vsi threadi končajo z izračunom ke, predn se začne sum
+    __syncthreads();
+
+    // Paralelno seštej vrednost celotnega ke v bloku
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            ke_cache[tid] += ke_cache[tid + s];
+        }
+        // Sync pred naslednim korakom
+        __syncthreads();
+    }
+
+    // Zapiši delno vsoto kinetične energije za ta blok
+    if (tid == 0) {
+        partial_ke[blockIdx.x] = ke_cache[0];
+    }
+}
+
+__global__ void sum_array_kernel(const double* input, double* output, unsigned int n) {
+    // Cache za delne vsote v bloku
+    // Uporabljamo sum_cache namesto input, ker je sum_cache shared memory in je hitrejši za dostop znotraj bloka, medtem ko je input global memory in je počasnejši, zato delamo delne vsote v sum_cache in potem seštejemo te delne vsote
+    extern __shared__ double sum_cache[];
+
+    // Thread idx
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int tid = threadIdx.x;
+
+    double sum = 0.0;
+    // While je zato, če se zgodi, da je en thread slučajno zadolžen za več subsumov
+    while (i < n) {
+        sum += input[i];
+        i += gridDim.x * blockDim.x;
+    }
+    sum_cache[tid] = sum;
+
+    // Počak da vsi threadi končajo z izračunom delnih vsot, predn se začne sum
+    __syncthreads();
+
+    // Paralelno seštej delne vsote v manjše delne vsote
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum_cache[tid] += sum_cache[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Zapiši končni rezultat celotnega sistema
+    if (tid == 0) {
+        output[blockIdx.x] = sum_cache[0];
+    }
+}
+
+double compute_keGPU(const Particle *particles, unsigned int n) {
+    size_t shared_mem_size = NUM_THREADS * sizeof(double);
+
+    int num_blocks = (n + NUM_THREADS - 1) / NUM_THREADS;
+    double *d_partial_ke_in;
+    double *d_partial_ke_out;
+    cudaMalloc(&d_partial_ke_in, num_blocks * sizeof(double));
+    cudaMalloc(&d_partial_ke_out, num_blocks * sizeof(double));
+
+    compute_ke_kernel<<<num_blocks, NUM_THREADS, shared_mem_size>>>(particles, d_partial_ke_in, n);
+
+    // Zdaj imamo delne vsote v d_partial_ke_in, potrebujemo še en kernel za seštevanje teh delnih vsot
+    while(num_blocks > 1) {
+        // Seštej delne vsote v d_partial_ke_in in shrani rezultat v d_partial_ke_out
+        int blocks = (num_blocks + NUM_THREADS - 1) / NUM_THREADS;
+        sum_array_kernel<<<blocks, NUM_THREADS, shared_mem_size>>>(d_partial_ke_in, d_partial_ke_out, num_blocks);
+        checkCudaErrors(cudaGetLastError());
+
+        // Zamenjaj pointerje, da bo d_partial_ke_in vedno kazal na trenutno delno vsoto, ki jo je treba sešteti v naslednjem koraku
+        double *temp = d_partial_ke_in;
+        d_partial_ke_in = d_partial_ke_out;
+        d_partial_ke_out = temp;
+        num_blocks = blocks;
+    }
+
+    double ke;
+    cudaMemcpy(&ke, d_partial_ke_in, sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(d_partial_ke_in);
+    cudaFree(d_partial_ke_out);
+
+    return ke;
+}
+
+// compute kinetic energy of the system
+double compute_keCPU(const Particle *particles, unsigned int n) {
+    double ke = 0.0;
+    #pragma omp parallel for reduction(+:ke)
     for (unsigned int i = 0; i < n; ++i) {
         const Particle *p = &particles[i];
         ke += 0.5 * (p->vx * p->vx + p->vy * p->vy);
@@ -71,6 +181,7 @@ int initialize_particles(Particle *particles, unsigned int n, double box_size, d
     double mean_vx = 0.0;
     double mean_vy = 0.0;
     // place particles int he middle of the grid with some random jitter and assign random velocities
+    #pragma omp parallel for reduction(+:mean_vx, mean_vy)
     for (unsigned int k = 0; k < n; k++) {
         double x0 = offset + (0.5 + (double)(k % n_side)) * delta;
         double y0 = offset + (0.5 + (double)(k / n_side)) * delta;
@@ -89,6 +200,7 @@ int initialize_particles(Particle *particles, unsigned int n, double box_size, d
     mean_vy /= (double)n;
     double ke = 0.0;
     // subtract mean velocity to ensure zero net momentum and compute initial kinetic energy
+    #pragma omp parallel for reduction(+:ke)
     for (unsigned int k = 0; k < n; k++) {
         particles[k].vx -= mean_vx;
         particles[k].vy -= mean_vy;
@@ -105,6 +217,7 @@ int initialize_particles(Particle *particles, unsigned int n, double box_size, d
 
     // scale velocities to match the desired initial temperature of the system
     double scale = sqrt(temperature / current_temperature);
+    #pragma omp parallel for
     for (unsigned int k = 0; k < n; k++) {
         particles[k].vx *= scale;
         particles[k].vy *= scale;
@@ -114,7 +227,8 @@ int initialize_particles(Particle *particles, unsigned int n, double box_size, d
 }
 
 // apply periodic boundary conditions to ensure particles stay within the simulation box
-void wrap_positions(Particle *particles, unsigned int n, double box_size) {
+void wrap_positionsCPU(Particle *particles, unsigned int n, double box_size) {
+    #pragma omp parallel for
     for (unsigned int i = 0; i < n; ++i) {
         Particle *p = &particles[i];
         double wx = fmod(p->x, box_size);
@@ -133,23 +247,132 @@ void wrap_positions(Particle *particles, unsigned int n, double box_size) {
 }
 
 // shift potential to ensure it goes to zero at the cutoff distance, improving energy conservation
-double compute_v_shift(void) {
+__host__ __device__ double compute_v_shift(void) {
     return 4.0 * EPSILON * (pow(SIGMA / R_CUT, 12.0) - pow(SIGMA / R_CUT, 6.0));
 }
 
-double compute_forces(Particle *particles, unsigned int n, double box_size) {
+__global__ void zero_forces_kernel(Particle *particles, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        particles[i].fx = 0.0;
+        particles[i].fy = 0.0;
+    }
+}
 
+__global__ void compute_forces_kernel(Particle *particles, double *potential_energy, unsigned int n, double box_size) {
+    // Thread idx
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // While je zato, če se zgodi, da je en thread slučajno zadolžen za več partiklov
+    while(i < n) {
+        // Pozicija partikla i
+        double pi_x = particles[i].x;
+        double pi_y = particles[i].y;
+
+        // Inicializiraj sile in potencialno energijo za partikla i
+        double fx = 0.0;
+        double fy = 0.0;
+        double pe = 0.0;
+
+        double v_shift = compute_v_shift();
+
+        for (unsigned int j = i + 1; j < n; j++) {
+            // Pozicija partikla j
+            double pj_x = particles[j].x;
+            double pj_y = particles[j].y;
+
+            // Izračun razdalje med partiklom i in j ob upoštevanju boxa
+            double dx = pi_x - pj_x;
+            double dy = pi_y - pj_y;
+            dx -= box_size * nearbyint(dx / box_size);
+            dy -= box_size * nearbyint(dy / box_size);
+
+            double r = sqrt(dx * dx + dy * dy);
+
+            // Izračunaj sile in potencialne energije, če sta partikla znotraj cutoff razdalje
+            if (r < R_CUT && r > 0.0) {
+                // LJ sile
+                double sr = SIGMA / r;
+                double fij = 24.0 * EPSILON * (2.0 * pow(sr, 12.0) - pow(sr, 6.0)) / r;
+                fx += fij * dx / r;
+                fy += fij * dy / r;
+
+                // Dodaj silo partiklu i
+                atomicAdd(&particles[i].fx, fx);
+                atomicAdd(&particles[i].fy, fy);
+
+                // Dodaj nasprotno silo partiklu j
+                // Dodaj mu nasprotno silo (3. Newtonov zakon)
+                atomicAdd(&particles[j].fx, -fx);
+                atomicAdd(&particles[j].fy, -fy);
+
+                // LJ potencialna energija
+                double vij = 4.0 * EPSILON * (pow(sr, 12.0) - pow(sr, 6.0)) - v_shift;
+                pe += 0.5 * vij;
+            }
+        }
+        // Posodobi sile in potencialno energijo za partikla i
+        potential_energy[i] = pe;
+
+        // Prestavi se na naslednji particle, ki ga ta thread obdeluje, če je potrebno
+        i += gridDim.x * blockDim.x;
+    }
+}
+
+double compute_forcesGPU(Particle *particles, unsigned int n, double box_size) {
+    size_t shared_mem_size = NUM_THREADS * sizeof(double);
+
+    double *d_potential_energy;
+    cudaMalloc(&d_potential_energy, n * sizeof(double));
+
+    int num_blocks = (n + NUM_THREADS - 1) / NUM_THREADS;
+    zero_forces_kernel<<<num_blocks, NUM_THREADS>>>(particles, n);
+    checkCudaErrors(cudaGetLastError());
+    compute_forces_kernel<<<num_blocks, NUM_THREADS>>>(particles, d_potential_energy, n, box_size);
+    checkCudaErrors(cudaGetLastError());
+
+    double *d_potential_energy_in;
+    double *d_potential_energy_out;
+    cudaMalloc(&d_potential_energy_in, num_blocks * sizeof(double));
+    cudaMalloc(&d_potential_energy_out, num_blocks * sizeof(double));
+
+    sum_array_kernel<<<num_blocks, NUM_THREADS, shared_mem_size>>>(d_potential_energy, d_potential_energy_in, n);
+    checkCudaErrors(cudaGetLastError());
+
+    n = num_blocks;
+
+    while(n > 1) {
+        num_blocks = (n + NUM_THREADS - 1) / NUM_THREADS;
+        sum_array_kernel<<<num_blocks, NUM_THREADS, shared_mem_size>>>(d_potential_energy_in, d_potential_energy_out, n);
+        checkCudaErrors(cudaGetLastError());
+
+        double *temp = d_potential_energy_in;
+        d_potential_energy_in = d_potential_energy_out;
+        d_potential_energy_out = temp;
+        n = num_blocks;
+    }
+
+    double pe;
+    cudaMemcpy(&pe, d_potential_energy_in, sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(d_potential_energy);
+    cudaFree(d_potential_energy_in);
+    cudaFree(d_potential_energy_out);
+
+    return pe;
+}
+
+double compute_forcesCPU(Particle *particles, unsigned int n, double box_size) {
+
+    #pragma omp parallel for
     for (unsigned int i = 0; i < n; ++i) {
         particles[i].fx = 0.0;
         particles[i].fy = 0.0;
     }
     double pe = 0.0;
     double v_shift = compute_v_shift();
+    #pragma omp parallel for reduction(+:pe)
     for (unsigned int i = 0; i < n; ++i) {
-        for (unsigned int j = 0; j < n; ++j) {
-            if (j == i) {
-                continue;
-            }
+        for (unsigned int j = i + 1; j < n; ++j) {
             Particle *pi = &particles[i];
             Particle *pj = &particles[j];
             
@@ -171,20 +394,98 @@ double compute_forces(Particle *particles, unsigned int n, double box_size) {
             double fx = fij * dx / r;
             double fy = fij * dy / r;
 
+            // 3. Newtnov zakon
+            #pragma omp atomic
             pi->fx += fx;
+            #pragma omp atomic
             pi->fy += fy;
+            
+            #pragma omp atomic
+            pj->fx -= fx;
+            #pragma omp atomic
+            pj->fy -= fy;
 
             double vij = 4.0 * EPSILON * (pow(sr, 12.0) - pow(sr, 6.0)) - v_shift;
-            pe += 0.5 * vij;
+            // Dodamo za oba partikla
+            pe += vij;
         }
     }
+
+    // Vrnemo polovico, ker smo prej dodal za oba partikla
+    return pe * 0.5;
+}
+
+__global__ void leapfrog_step1_kernel(Particle *particles, unsigned int n, double box_size) {
+    // Thread idx
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // While je zato, če se zgodi, da je en thread slučajno zadolžen za več partiklov
+    while(i < n) {
+        Particle *p = &particles[i];
+        // Updatei hitrosti za polovico časovnega koraka
+        p->vx += 0.5 * DT * p->fx;
+        p->vy += 0.5 * DT * p->fy;
+
+        // Updatei pozicije za cel časovni korak
+        p->x += DT * p->vx;
+        p->y += DT * p->vy;
+
+        // Periodično zavijanje pozicij nazaj v box, da ostanejo znotraj meja
+        // to je ubistvu wrap_positionsGPU, sam je tuki da ni treba dodatnega kernelja
+        double wx = fmod(p->x, box_size);
+        double wy = fmod(p->y, box_size);
+        if (wx < 0.0) {
+            wx += box_size;
+        }
+        if (wy < 0.0) {
+            wy += box_size;
+        }
+
+        // Posodobi pozicije
+        p->x = wx;
+        p->y = wy;
+
+        i += gridDim.x * blockDim.x;
+    }
+}
+
+__global__ void leapfrog_step2_kernel(Particle *particles, unsigned int n) {
+    // Thread idx
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // While je zato, če se zgodi, da je en thread slučajno zadolžen za več partiklov
+    while (i < n) {
+        Particle *p = &particles[i];
+        // Updatei hitrosti za drugo polovico časovnega koraka z novimi silami
+        p->vx += 0.5 * DT * p->fx;
+        p->vy += 0.5 * DT * p->fy;
+        
+        i += gridDim.x * blockDim.x;
+    }
+}
+
+double leapfrog_stepGPU(Particle *d_particles, unsigned int n, double box_size) {
+    int num_threads = NUM_THREADS;
+    int num_blocks = (n + num_threads - 1) / num_threads;
+
+    // Nared prvi del za polovico koraka
+    leapfrog_step1_kernel<<<num_blocks, num_threads>>>(d_particles, n, box_size);
+    checkCudaErrors(cudaGetLastError());
+
+    // Izračunaj sile in potencialno energijo z novimi pozicijami
+    double pe = compute_forcesGPU(d_particles, n, box_size);
+
+    // Nared drugi del za drugo polovico koraka
+    leapfrog_step2_kernel<<<num_blocks, num_threads>>>(d_particles, n);
+    checkCudaErrors(cudaGetLastError());
 
     return pe;
 }
 
-double leapfrog_step(Particle *particles, unsigned int n, double box_size) {
+double leapfrog_stepCPU(Particle *particles, unsigned int n, double box_size) {
     // update velocities by half a time step, then update positions by a full time step, 
     //and finally update velocities by another half time step to complete the leapfrog integration step
+    #pragma omp parallel for
     for (unsigned int i = 0; i < n; ++i) {
         Particle *p = &particles[i];
         p->vx += 0.5 * DT * p->fx;
@@ -194,9 +495,9 @@ double leapfrog_step(Particle *particles, unsigned int n, double box_size) {
         p->y += DT * p->vy;
     }
 
-    wrap_positions(particles, n, box_size);
+    wrap_positionsCPU(particles, n, box_size);
 
-    double pe = compute_forces(particles, n, box_size);
+    double pe = compute_forcesCPU(particles, n, box_size);
 
     for (unsigned int i = 0; i < n; ++i) {
         Particle *p = &particles[i];
@@ -208,28 +509,62 @@ double leapfrog_step(Particle *particles, unsigned int n, double box_size) {
 }
 
 SimulationResult run_simulation(Particle *particles, unsigned int n, unsigned int nsteps, double box_size, int log_steps) {
-    
-    SimulationResult out;
-    out.start_potential= compute_forces(particles, n, box_size);
-    out.start_kinetic = compute_ke(particles, n);
-    out.start_total = out.start_kinetic + out.start_potential;
 
-    
+    SimulationResult out;
+
+#if RUN_CPU
+    out.start_potential= compute_forcesCPU(particles, n, box_size);
+    out.start_kinetic = compute_keCPU(particles, n);
+#else
+    // Pointer na partikle na GPU
+    Particle* d_particles = NULL;
+    // Pointer na partikle na CPU (pinned memory)
+    Particle* h_particles_pinned = NULL;
+
+#if GENERATE_GIF
+    // Alociranje PINNED pomnilnika, ki je dostopen tudi CPU-ju in GPU-ju
+    checkCudaErrors(cudaHostAlloc(&h_particles_pinned, n * sizeof(Particle), cudaHostAllocMapped));
+    checkCudaErrors(cudaHostGetDevicePointer(&d_particles, h_particles_pinned, 0));
+
+    // Kopiranje začetnih podatkov iz običajnega calloc v PINNED calloc
+    memcpy(h_particles_pinned, particles, n * sizeof(Particle));
+#else
+    // Allociranje direktno na GPU
+    checkCudaErrors(cudaMalloc(&d_particles, n * sizeof(Particle)));
+    checkCudaErrors(cudaMemcpy(d_particles, particles, n * sizeof(Particle), cudaMemcpyHostToDevice));
+#endif
+
+    out.start_potential= compute_forcesGPU(d_particles, n, box_size);
+    out.start_kinetic = compute_keGPU(d_particles, n);
+#endif        
+
+    out.start_total = out.start_kinetic + out.start_potential;
+        
 #if GENERATE_GIF
     ge_GIF *gif = NULL;
-
     gif = ge_new_gif(GIF_FILE, (uint16_t)FRAME_WIDTH, (uint16_t)FRAME_HEIGHT, palette, 8, -1, 0);
     if (!gif) {
         fprintf(stderr, "Warning: failed to create GIF output %s\n", GIF_FILE);
     } else {
+        // Render the first frame
+#if RUN_CPU
         render_frame_gif(gif, particles, n, box_size);
+#else
+        render_frame_gif(gif, h_particles_pinned, n, box_size);
+#endif
         ge_add_frame(gif, FRAME_DELAY);
     }
 #endif
 
     for (unsigned int step = 0; step < nsteps; step++) {
-        out.final_potential = leapfrog_step(particles, n, box_size);
-        out.final_kinetic = compute_ke(particles, n);
+#if RUN_CPU
+        out.final_potential = leapfrog_stepCPU(particles, n, box_size);
+        out.final_kinetic = compute_keCPU(particles, n);
+#else
+        out.final_potential = leapfrog_stepGPU(d_particles, n, box_size);
+        out.final_kinetic = compute_keGPU(d_particles, n);
+#endif
+        
         out.final_total = out.final_kinetic + out.final_potential;
         if (log_steps) {
             printf(
@@ -240,11 +575,15 @@ SimulationResult run_simulation(Particle *particles, unsigned int n, unsigned in
                 out.final_total
             );
         }
-
     
 #if GENERATE_GIF
         if (gif && FRAME_EVERY > 0 && (step + 1) % FRAME_EVERY == 0) {
+#if RUN_CPU
             render_frame_gif(gif, particles, n, box_size);
+#else
+            checkCudaErrors(cudaDeviceSynchronize()); 
+            render_frame_gif(gif, h_particles_pinned, n, box_size);
+#endif
             ge_add_frame(gif, FRAME_DELAY);
         }
 #endif
@@ -254,6 +593,20 @@ SimulationResult run_simulation(Particle *particles, unsigned int n, unsigned in
     if (gif) {
         ge_close_gif(gif);
     }
+#endif
+
+#if !RUN_CPU
+    checkCudaErrors(cudaDeviceSynchronize());
+#if GENERATE_GIF
+    // Pinned memory cleanup
+    memcpy(particles, h_particles_pinned, n * sizeof(Particle));
+    checkCudaErrors(cudaFreeHost(h_particles_pinned));
+#else
+    // Kopiranje zadnega reyultata nazaj na CPU
+    checkCudaErrors(cudaMemcpy(particles, d_particles, n * sizeof(Particle), cudaMemcpyDeviceToHost));
+    // Free GPU memory
+    checkCudaErrors(cudaFree(d_particles));
+#endif
 #endif
 
     out.n = n;

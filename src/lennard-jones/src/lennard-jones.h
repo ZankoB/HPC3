@@ -51,6 +51,9 @@ int initialize_particles(
 );
 void wrap_positions(Particle *particles, unsigned int n, double box_size);
 
+#ifdef __CUDACC__
+__host__ __device__
+#endif
 double compute_v_shift(void);
 double compute_forces(
     Particle *particles,
