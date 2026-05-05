@@ -13,7 +13,7 @@
 #include "lennard-jones.h"
 
 #define NUM_THREADS 128
-#define RUN_CPU 1
+#define RUN_CPU 0
 
 // plotting functions
 #if GENERATE_GIF
@@ -512,8 +512,8 @@ SimulationResult run_simulation(Particle *particles, unsigned int n, unsigned in
     SimulationResult out;
 
 #if RUN_CPU
-    out.start_potential= compute_forces(particles, n, box_size);
-    out.start_kinetic = compute_ke(particles, n);
+    out.start_potential= compute_forcesCPU(particles, n, box_size);
+    out.start_kinetic = compute_keCPU(particles, n);
 #else
     // Pointer na partikle na GPU
     Particle* d_particles = NULL;
